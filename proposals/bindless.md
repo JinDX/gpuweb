@@ -380,7 +380,7 @@ This validation could be made to check conflicts at the subresources level in a 
 Additional internal state is added to `GPUResourceTable`:
 
  - An `Array<GPUBindingResource?>` called `[[resources]]` of size `this.size` initially filled with `null` values.
- - A `Map<GPUTexture|GPUBuffer, GPUResourceTableUsage>` called `[[resource_usage]]` initially empty.
+ - A `WeakMap<GPUTexture|GPUBuffer, GPUResourceTableUsage>` called `[[resource_usage]]` initially empty.
 
 Steps for `GPUResourceTable.isShaderVisible(slot, wgslType, usage_scope)` are:
 
@@ -394,14 +394,14 @@ Steps for `GPUResourceTable.isShaderVisible(slot, wgslType, usage_scope)` are:
     - `subresource` otherwise.
 
  - If `resource.[[destroyed]]`, return `false`.
- - Switch on `this.[[resource_usage]][resource]` defaulted to `readonly` is not present (see section below):
+ - Switch on `this.[[resource_usage]][resource]`, defaulting to `readonly` if not present (see section below):
 
    - Case `"none"`, return false.
    - Case `"readonly"`:
 
      - If any of the subresources of `resource` is writable in `usage_scope`, return `false`.
 
-   - Case `storage-read-write`:
+   - Case `"writable"`:
 
      - If any of the subresources of `resource` has any usage other than `"storage"` in `usage_scope`, return `false`.
 
@@ -412,7 +412,7 @@ Steps for `GPUResourceTable.isShaderVisible(slot, wgslType, usage_scope)` are:
  - The check for visibility and compatibility with `wgslType` can be done as a single enum comparision on the shader.
  - To avoid iterating over all the resources, the check for `[[destroyed]]` requires `GPUResourceTable` to be notified when `.destroy()` happen and to update the metadata for all the corresponding slots.
  - The check for conflicts between resource table `readonly` usages and the bindful `usage_scope` can be done by iterating the writable resources of `usage_scope` and hiding slots using those resources (there should be few of them in practice).
- - The check for conflicts between resource table `storage-read-write` usages and the bindful `usage_scope` can be done similarly, or by iterating writable resources of the table (these should be rare as well).
+ - The check for conflicts between resource table `writable` usages and the bindful `usage_scope` can be done similarly, or by iterating writable resources of the table (these should be rare as well).
  - When resource state change (memory barriers, marked as uninitialized for lazy zero initialization, etc), they need to notify the `GPUResourceTable` so it can perform the necessary operations the next time it is used (clearing the resource, memory barrier, etc).
 
 #### Resource usage state in the resource tables.
@@ -481,10 +481,14 @@ table.barrierAndMakeVisible(shadowMaps);
 renderMainPassWithTable(table, shadowMaps);
 ```
 
-When resources are added to a resource table, they start with the `readonly` usage.
+Resources have the `readonly` usage in a resource table until `setResourceUsage` is called for them.
 That's because readonly resources are the most common case by far in resource tables: `sampling-resource-table` only allows readonly resources, and the most obvious use of resource tables is to stuff all the assets' textures in it.
 There is also value in users not having to remember to call an initial `setResourceUsage` when first starting to add sampled textures in the resource table, so `none` wouldn't be a good default.
 Otherwise they'd start getting the default resource and spend some time figuring out that a `setResourceUsage` call is needed.
+
+The usage is tracked per resource for each resource table, independently of whether the resource is currently in any slot of the table.
+Calling `setResourceUsage` for a resource that is not in the table (because it was never added, or because it was removed from all its slots) is valid, and the usage is remembered: it applies if the resource is added to the table later.
+`[[resource_usage]]` is a `WeakMap` so that calling `setResourceUsage` does not keep a resource alive when it is otherwise unused in the resource table.
 
 The concrete API and steps related to resource usage state are below.
 
@@ -623,7 +627,7 @@ table, it's implicitly available if a `GPUResourceTable` has been bound.
 
 In order to access the resource table two new methods are added, `getResource` and `hasResource`.
 
-The WGSL language extension (https://github.com/gpuweb/issues/5611) to eliminate aliasing
+The WGSL language extension (https://github.com/gpuweb/gpuweb/issues/5611) to eliminate aliasing
 restrictions is required for WGSL bindless support.
 
 #### New enable extension
@@ -679,33 +683,27 @@ Essentially, a value is always returned, it may be a synthesized default value.
 
 ###### Default Resources
 When a given index is either out of bounds, or the requested `T` type does not match what is bound
-a default resource is returned. These resources are defined as:
+a default resource is returned. Default resources are provided by the implementation; they are not
+declared in WGSL and are not part of the `GPUResourceTable`'s visible slots.
 
-TODO: [#5471](https://github.com/gpuweb/gpuweb/issues/5471) Define the default resources
-<table>
-<tr><th>Type<th>Defaults
-<tr>
-    <td>format-less storage texture
-    <td>
-<tr>
-    <td>sampled texture
-    <td>
-<tr>
-    <td>multisampled texture
-    <td>
-<tr>
-    <td>depth texture
-    <td>
-<tr>
-    <td>sampler
-    <td>
-</table>
+ - For texture types, the default resource is a view of type `T` onto a texture with the minimum
+   number of layers that is valid for `T`, a single texel per layer and a single mip level. The bit
+   representation of each texel is 0. This is safe because texture builtins bounds-check or clamp
+   their coordinates, as they do for textures in bind groups.
+ - For `sampler`, the default resource is a sampler created with a default `GPUSamplerDescriptor`.
+   All its filters are `"nearest"`, so it is non-filtering and can be used with any texture.
+ - For `sampler_comparison`, the default resource is a comparison sampler created with an otherwise
+   default `GPUSamplerDescriptor`.
+
+Default resources for buffers need a minimum size instead; see
+[#11059](https://github.com/gpuweb/gpuweb/issues/11059).
 
 #### Type Compatibility Rules
-The `T` types used in the `getResource` and `hasResource` methods allow some flexibility in their
-types based on the filtering settings.
-
-TODO: [#5470](https://github.com/gpuweb/gpuweb/issues/5470) define the compatibility rules when they are known.
+The `T` types used in the `getResource` and `hasResource` methods do not carry filterability
+information: there are no `filterable` / `unfilterable` or `filtering` / `non-filtering`
+annotations in WGSL. Instead, the compatibility between a texture and the sampler it is used with
+is validated dynamically where they are combined, as described in the
+[WGSL Bindless Filterability Validation](bindless-filterability-validation.md) proposal.
 
 
 #### Example usage
